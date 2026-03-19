@@ -26,6 +26,14 @@ def clean_script_tn(text: str) -> str:
     return re.sub(r"\[([^\]]*)\]", r"\1", text).strip()
 
 
+def clean_main_transcript(text: str) -> str:
+    # Remove leading "n/" prefix (e.g. "n/ 아/ 그러면..." → "아/ 그러면...")
+    text = re.sub(r"^n/\s*", "", text)
+    # Replace (A)/(B) with A (e.g. "(56)/(오 육)" → "56", "(렌탈)/(렌털)" → "렌탈")
+    text = re.sub(r"\(([^)]+)\)/\([^)]+\)", r"\1", text)
+    return text.strip()
+
+
 def probe_wav_format(z: zipfile.ZipFile, key: str):
     try:
         with z.open(key) as f:
@@ -101,7 +109,7 @@ def process_main(main_dir: str, split: str, min_dur: float, max_dur: float, max_
                     for dlg in data["dataSet"]["dialogs"]:
                         ap = dlg["audioPath"].replace("KtelSpeech/", "", 1)
                         tp = dlg["textPath"].replace("KtelSpeech/", "", 1)
-                        transcript = txt_map.get(tp, "").strip()
+                        transcript = clean_main_transcript(txt_map.get(tp, ""))
                         if transcript and ap in wav_index:
                             pairs.append((ap, transcript))
                 except Exception:
@@ -159,7 +167,7 @@ def process_aux(aux_dir: str, split: str, min_dur: float, max_dur: float) -> lis
             for line in content.splitlines():
                 if line.startswith("scriptID"):
                     sid = line.split(":", 1)[1].strip()
-                elif line.startswith("scriptTN"):
+                elif line.startswith("scriptITN"):
                     stn = line.split(":", 1)[1].strip()
             if sid and stn:
                 script_map[sid] = clean_script_tn(stn)
