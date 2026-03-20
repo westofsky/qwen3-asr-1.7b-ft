@@ -23,7 +23,7 @@ python prepare_dataset.py
 ## 학습
 
 ```bash
-python train.py --config config.yaml
+python train.py --max_steps 2000
 ```
 
 ## 모델 내보내기
