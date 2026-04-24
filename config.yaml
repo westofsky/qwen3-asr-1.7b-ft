@@ -2,12 +2,16 @@ model_name_or_path: "Qwen/Qwen3-ASR-1.7B"
 output_dir: "./checkpoints"
 data_dir: "./data"
 
+# Data sources
+main_dir: "/home/tantancore/007.저음질_전화망_음성인식_데이터"   # WAV 8kHz 전화망
+aux_dir:  "/home/tantancore/159.숫자가_포함된_패턴_발화_데이터" # PCM 16kHz clean
+
 # Training (A100 80GB 기준)
 per_device_train_batch_size: 32
 per_device_eval_batch_size: 32
 gradient_accumulation_steps: 2          # effective batch = 64
-learning_rate: 1.0e-5
-warmup_steps: 500
+learning_rate: 2.0e-5
+warmup_ratio: 0.02
 max_steps: 10000
 eval_steps: 500
 save_steps: 1000
@@ -21,8 +25,14 @@ metric_for_best_model: "cer"            # Character Error Rate
 # Data
 max_duration: 30.0
 min_duration: 0.3
-aux_ratio: 0.10                         # 보조데이터 비율 (전체 train 기준)
+aux_ratio: 0.15                         # 159(숫자) 보조데이터 비율
 max_label_length: 448
 language: "ko"
 task: "transcribe"
 seed: 42
+
+# Asterisk 16k narrowband 매칭 어그멘테이션
+# - aux(159)는 clean 16k이므로 4kHz 대역제한을 강하게 적용 (Asterisk 전화망 신호에 맞춤)
+# - main(007)은 이미 8k 전화망 소스(업샘플만 하면 자연히 narrowband@16k)라 기본 off
+aux_phone_prob:  1.0
+main_phone_prob: 0.0

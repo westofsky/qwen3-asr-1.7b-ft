@@ -3,10 +3,13 @@
 Qwen3-ASR-1.7B full fine-tuning
 - 공식 qwen-asr 패키지 사용 (Qwen3ASRModel)
 - zip에서 on-the-fly로 오디오 읽기 (추출 없음)
-- bf16, gradient checkpointing, 실시간 progress bar
+- bf16, gradient checkpointing
+- Asterisk 16k (narrowband-in-16k) 타깃:
+    aux(159, 16k clean) 샘플에 4kHz band-limit 필터를 기본 적용,
+    main(007, 8k 전화망) 샘플은 이미 narrowband이므로 업샘플만.
 """
-import argparse, io, json, os, re, shutil, zipfile
-from dataclasses import dataclass
+import argparse, io, json, os, random, re, shutil, zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +35,7 @@ def _read_from_zip(zip_path: str, key: str) -> bytes:
 
 
 def load_audio_from_record(rec: dict, sr: int = 16000) -> np.ndarray:
-    """zip에서 오디오를 읽어 float32 numpy 배열로 반환."""
+    """zip에서 오디오를 읽어 float32 numpy 배열로 반환 (sr로 리샘플)."""
     raw = _read_from_zip(rec["zip_path"], rec["audio_key"])
 
     if rec["format"] == "pcm":
@@ -44,9 +47,26 @@ def load_audio_from_record(rec: dict, sr: int = 16000) -> np.ndarray:
             audio = audio.mean(axis=1)
 
     if orig_sr != sr:
-        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=sr)
+        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=sr, res_type="kaiser_fast")
 
     return audio
+
+
+# ── Asterisk narrowband-in-16k 시뮬레이션 ─────────────────────────────────────
+
+def phone_band_filter(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """16k→8k→16k 라운드트립으로 4kHz 대역제한.
+    Asterisk가 narrowband(PCMU/PCMA/G.729) 통화를 16k로 올려 전달하는 신호를 근사."""
+    if sr != 16000 or len(audio) < 32:
+        return audio
+    lo = librosa.resample(audio, orig_sr=sr, target_sr=8000, res_type="kaiser_fast")
+    up = librosa.resample(lo, orig_sr=8000, target_sr=sr, res_type="kaiser_fast")
+    # 길이 보정 (resample이 미세하게 길이 바꿀 수 있음)
+    if len(up) > len(audio):
+        up = up[:len(audio)]
+    elif len(up) < len(audio):
+        up = np.pad(up, (0, len(audio) - len(up)))
+    return up.astype(np.float32, copy=False)
 
 
 # ── 공식 스크립트에서 가져온 유틸 ────────────────────────────────────────────
@@ -96,17 +116,34 @@ def copy_required_hf_files(src_dir: str, dst_dir: str):
             shutil.copy2(src, os.path.join(dst_dir, fn))
 
 
-# ── 데이터 콜레이터 (zip에서 직접 읽기) ──────────────────────────────────────
+# ── 데이터 콜레이터 (zip에서 직접 읽기 + 전화망 시뮬레이션) ──────────────────
 
 @dataclass
 class DataCollatorZipASR:
     processor: Any
     sampling_rate: int = 16000
-    _prefix_len: int = -1   # 첫 배치에서 한 번만 계산 후 캐시
+    aux_phone_prob: float = 1.0     # 159(clean 16k) → phone-band 강제 (Asterisk 매칭)
+    main_phone_prob: float = 0.0    # 007은 이미 8k 전화망 소스라 불필요
+    seed: int = 42
+    _prefix_len: int = -1
+    _rng: Optional[random.Random] = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        # worker별 재현 가능한 RNG (seed + pid)
+        self._rng = random.Random(self.seed + os.getpid())
+
+    def _maybe_augment(self, audio: np.ndarray, source: str) -> np.ndarray:
+        prob = self.aux_phone_prob if source == "aux" else self.main_phone_prob
+        if prob > 0 and self._rng.random() < prob:
+            audio = phone_band_filter(audio, self.sampling_rate)
+        return audio
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # zip에서 오디오 로드
-        audios = [load_audio_from_record(f, sr=self.sampling_rate) for f in features]
+        audios = []
+        for f in features:
+            a = load_audio_from_record(f, sr=self.sampling_rate)
+            a = self._maybe_augment(a, f.get("source", "main"))
+            audios.append(a)
 
         prefix_texts = [f["prefix_text"] for f in features]
         targets      = [f["target"] for f in features]
@@ -114,13 +151,11 @@ class DataCollatorZipASR:
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
 
-        # processor 호출 1회 (full text + audio)
         full_inputs = self.processor(
             text=full_texts, audio=audios,
             return_tensors="pt", padding=True, truncation=False,
         )
 
-        # prefix_len: 처음 한 번만 계산 (모든 샘플의 prompt가 동일하므로 고정값)
         if self._prefix_len < 0:
             prefix_inputs = self.processor(
                 text=[prefix_texts[0]], audio=[audios[0]],
@@ -170,8 +205,6 @@ def build_hf_dataset(manifest_path: str, processor) -> HFDataset:
         for line in f:
             records.append(json.loads(line))
 
-    # prompt가 모두 동일하면 prefix_text를 한 번만 생성
-    # 다른 prompt가 있으면 그룹별로 캐싱
     prefix_cache: dict = {}
 
     def get_prefix_text(prompt: str) -> str:
@@ -196,23 +229,29 @@ def build_hf_dataset(manifest_path: str, processor) -> HFDataset:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path",   default="Qwen/Qwen3-ASR-1.7B")
-    parser.add_argument("--train_file",   default="./data/train.jsonl")
-    parser.add_argument("--eval_file",    default="./data/valid.jsonl")
-    parser.add_argument("--output_dir",   default="./checkpoints")
-    parser.add_argument("--sr",           type=int,   default=16000)
-    parser.add_argument("--batch_size",   type=int,   default=32)
-    parser.add_argument("--grad_acc",     type=int,   default=2)   # effective batch=64
-    parser.add_argument("--lr",           type=float, default=2e-5)
-    parser.add_argument("--max_steps",    type=int,   default=5000) # 4시간 기준
-    parser.add_argument("--save_steps",   type=int,   default=500)
-    parser.add_argument("--log_steps",    type=int,   default=25)
-    parser.add_argument("--num_workers",  type=int,   default=4)
-    parser.add_argument("--resume",       action="store_true")
+    parser.add_argument("--model_path",      default="Qwen/Qwen3-ASR-1.7B")
+    parser.add_argument("--train_file",      default="./data/train.jsonl")
+    parser.add_argument("--eval_file",       default="./data/valid.jsonl")
+    parser.add_argument("--output_dir",      default="./checkpoints")
+    parser.add_argument("--sr",              type=int,   default=16000)
+    parser.add_argument("--batch_size",      type=int,   default=32)
+    parser.add_argument("--grad_acc",        type=int,   default=2)     # effective batch=64
+    parser.add_argument("--lr",              type=float, default=2e-5)
+    parser.add_argument("--max_steps",       type=int,   default=5000)
+    parser.add_argument("--save_steps",      type=int,   default=500)
+    parser.add_argument("--log_steps",       type=int,   default=25)
+    parser.add_argument("--num_workers",     type=int,   default=4)
+    parser.add_argument("--aux_phone_prob",  type=float, default=1.0,
+                        help="aux(159) clean 음성에 4kHz 대역제한 적용 확률")
+    parser.add_argument("--main_phone_prob", type=float, default=0.0,
+                        help="main(007) 음성에 추가 대역제한 적용 확률 (기본 off: 이미 8k 소스)")
+    parser.add_argument("--seed",            type=int,   default=42)
+    parser.add_argument("--resume",          action="store_true")
     args = parser.parse_args()
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     print(f"Loading: {args.model_path}  bf16={use_bf16}")
+    print(f"Phone-band aug: aux={args.aux_phone_prob}  main={args.main_phone_prob}")
 
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         args.model_path,
@@ -230,7 +269,13 @@ def main():
     eval_ds  = build_hf_dataset(args.eval_file, processor) if args.eval_file else None
     print(f"Train: {len(train_ds):,}  Valid: {len(eval_ds) if eval_ds else 0:,}")
 
-    collator = DataCollatorZipASR(processor=processor, sampling_rate=args.sr)
+    collator = DataCollatorZipASR(
+        processor=processor,
+        sampling_rate=args.sr,
+        aux_phone_prob=args.aux_phone_prob,
+        main_phone_prob=args.main_phone_prob,
+        seed=args.seed,
+    )
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -256,6 +301,7 @@ def main():
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         report_to="none",
+        seed=args.seed,
     )
 
     trainer = CastFloatInputsTrainer(
