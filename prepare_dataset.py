@@ -22,7 +22,18 @@ Usage:
 import re, json, zipfile, struct, argparse, random
 from pathlib import Path
 from collections import defaultdict
+
+import yaml
 from tqdm import tqdm
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    """config.yaml을 argparse 기본값 소스로 사용 (CLI가 항상 우선)."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p) as f:
+        return yaml.safe_load(f) or {}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -248,15 +259,16 @@ def write_jsonl(records, path):
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    cfg = load_config()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--main_dir",     default="/home/tantancore/007.저음질_전화망_음성인식_데이터")
-    parser.add_argument("--aux_dir",      default="/home/tantancore/159.숫자가_포함된_패턴_발화_데이터")
-    parser.add_argument("--output_dir",   default="./data")
-    parser.add_argument("--aux_ratio",    type=float, default=0.15)
-    parser.add_argument("--max_duration", type=float, default=30.0)
-    parser.add_argument("--min_duration", type=float, default=0.3)
+    parser.add_argument("--main_dir",     default=cfg.get("main_dir",  "/mnt/data/007.저음질_전화망_음성인식_데이터"))
+    parser.add_argument("--aux_dir",      default=cfg.get("aux_dir",   "/mnt/data/159.숫자가_포함된_패턴_발화_데이터"))
+    parser.add_argument("--output_dir",   default=cfg.get("data_dir",  "./data"))
+    parser.add_argument("--aux_ratio",    type=float, default=cfg.get("aux_ratio",    0.15))
+    parser.add_argument("--max_duration", type=float, default=cfg.get("max_duration", 30.0))
+    parser.add_argument("--min_duration", type=float, default=cfg.get("min_duration", 0.3))
     parser.add_argument("--max_samples",  type=int,   default=0)
-    parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--seed",         type=int,   default=cfg.get("seed", 42))
     args = parser.parse_args()
 
     random.seed(args.seed)

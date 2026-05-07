@@ -3,14 +3,14 @@ output_dir: "./checkpoints"
 data_dir: "./data"
 
 # Data sources
-main_dir: "/home/tantancore/007.저음질_전화망_음성인식_데이터"   # WAV 8kHz 전화망
-aux_dir:  "/home/tantancore/159.숫자가_포함된_패턴_발화_데이터" # PCM 16kHz clean
+main_dir: "/mnt/data/007.저음질_전화망_음성인식_데이터"   # WAV 8kHz 전화망
+aux_dir:  "/mnt/data/159.숫자가_포함된_패턴_발화_데이터" # PCM 16kHz clean
 
 # Training (A100 80GB 기준)
 per_device_train_batch_size: 32
 per_device_eval_batch_size: 32
-gradient_accumulation_steps: 2          # effective batch = 64
-learning_rate: 2.0e-5
+gradient_accumulation_steps: 2          # 2 GPU DDP: 32 * 2 * 2 = effective batch 128
+learning_rate: 3.0e-5                   # batch 2배(64→128)에 맞춰 sqrt 스케일링
 warmup_ratio: 0.02
 max_steps: 10000
 eval_steps: 500
